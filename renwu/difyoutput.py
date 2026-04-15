@@ -3,7 +3,7 @@
 脚本名称: dify_workflow_invoke.py
 功能: 从 Hive 源表读取搜索日志数据，调用 Dify 工作流 API 进行模型排序评测，
      并将结果写入 Hive 目标表。
-依赖: pyspark, requests, argparse
+依赖: pyspark, requests, pandas, argparse
 """
 
 import argparse
@@ -12,11 +12,12 @@ import logging
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
+import pandas as pd
 import requests
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, first, struct
+from pyspark.sql.functions import col, lit
 from pyspark.sql.types import (
     IntegerType,
     StringType,
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ---------- Dify API 调用函数 ----------
 def call_dify_workflow(
-    api_key: Optional[str],
+    api_key: str,
     workflow_id: str,
     dify_url: str,
     inputs: Dict[str, str],
@@ -43,12 +44,12 @@ def call_dify_workflow(
     retry_delay: float = 1.0,
 ) -> Optional[Dict]:
     """
-    调用 Dify 工作流 API（同步执行模式），支持公开访问（无认证）。
+    调用 Dify 工作流 API（同步执行模式）。
 
     Args:
-        api_key: Dify API 密钥；若为 None 或空字符串，则不添加 Authorization 头
-        workflow_id: 工作流 ID
-        dify_url: Dify 服务基础地址（如 https://dify.17usoft.com）
+        api_key: Dify API 密钥
+        workflow_id: 工作流 ID（放在请求体中）
+        dify_url: Dify API 基础地址（如 https://difyapi.17usoft.com/v1）
         inputs: 工作流输入参数（dict）
         max_retries: 最大重试次数
         retry_delay: 初始重试间隔（秒）
@@ -56,13 +57,16 @@ def call_dify_workflow(
     Returns:
         成功时返回 API 响应中的 outputs 部分（dict）；失败返回 None
     """
-    url = f"{dify_url.rstrip('/')}/workflows/{workflow_id}/run"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    url = f"{dify_url.rstrip('/')}/workflows/run"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
     payload = {
+        "workflow_id": workflow_id,
         "inputs": inputs,
         "response_mode": "blocking",
+        "user": "spark_task",
     }
 
     for attempt in range(max_retries):
@@ -70,7 +74,6 @@ def call_dify_workflow(
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
             if resp.status_code == 200:
                 data = resp.json()
-                # Dify 同步返回结构通常为 {"data": {"outputs": {...}}}
                 outputs = data.get("data", {}).get("outputs", {})
                 if outputs:
                     return outputs
@@ -95,25 +98,66 @@ def call_dify_workflow(
     return None
 
 
-# ---------- 批量处理函数（用于 foreachPartition） ----------
+# ---------- 解析 Dify 输出 ----------
+def parse_dify_output(outputs: Dict) -> tuple:
+    """
+    解析 Dify 返回的 outputs，提取评分字段。
+
+    Args:
+        outputs: API 返回的 outputs 字典
+
+    Returns:
+        (dify_score, core_position, chaos, special_penalty)
+    """
+    try:
+        # outputs 结构: {"result": [{"result": "{\"评分\":..., ...}"}]}
+        result_list = outputs.get("result", [])
+        if isinstance(result_list, list) and len(result_list) > 0:
+            result_str = result_list[0].get("result", "{}")
+            final_result = json.loads(result_str)
+            score = final_result.get("评分")
+            core_pos = final_result.get("核心结果位置")
+            chaos = final_result.get("混乱度")
+            special_penalty = final_result.get("特殊场景扣分")
+            # 可选：评分依据不保存到表，仅记录日志
+            reason = final_result.get("评分依据", "")
+            if reason:
+                logger.debug("评分依据: %s", reason[:200])
+            return score, core_pos, chaos, special_penalty
+        else:
+            logger.warning("outputs 中没有 result 列表: %s", outputs)
+            return None, None, None, None
+    except Exception as e:
+        logger.error("解析 outputs 失败: %s, outputs: %s", e, outputs)
+        return None, None, None, None
+
+
+# ---------- 分区处理函数（用于 foreachPartition） ----------
 def process_partition(
     partition_rows,
-    api_key: Optional[str],
+    api_key: str,
     workflow_id: str,
     dify_url: str,
-    result_table: str,
     target_year: int,
     target_month: int,
     target_day: int,
+    result_table: str,
 ):
-    """分区处理函数，同上，增加 dify_url 参数"""
+    """
+    在每个分区内逐行调用 Dify API，收集结果并写入 Hive 表。
+    注意：此函数运行在 Executor 上，不能直接使用 SparkSession 的 write，
+         因此先将结果收集到列表，最后通过新 SparkSession 写入。
+         但为了性能，建议使用 foreachBatch 或 collect 后 Driver 写入。
+         此处采用每个分区内写入（需注意并发写同分区问题）。
+         简化：我们将在 Driver 端统一写入，因此本函数只返回结果列表。
+    """
     import pandas as pd
     from pyspark.sql import SparkSession
 
     spark = SparkSession.getActiveSession()
     if spark is None:
         logger.error("无法获取 SparkSession")
-        return
+        return []
 
     results = []
     for row in partition_rows:
@@ -128,23 +172,9 @@ def process_partition(
         outputs = call_dify_workflow(api_key, workflow_id, dify_url, inputs)
 
         if outputs:
-            final_result = outputs.get("result", {})
-            if isinstance(final_result, str):
-                try:
-                    final_result = json.loads(final_result)
-                except:
-                    pass
-            score = final_result.get("评分", None)
-            core_pos = final_result.get("核心结果位置", None)
-            chaos = final_result.get("混乱度", None)
-            special_penalty = final_result.get("特殊场景扣分", None)
-            reason = final_result.get("评分依据", "")
+            score, core_pos, chaos, special_penalty = parse_dify_output(outputs)
         else:
-            score = None
-            core_pos = None
-            chaos = None
-            special_penalty = None
-            reason = "API调用失败"
+            score = core_pos = chaos = special_penalty = None
 
         results.append({
             "traceid": row.traceid,
@@ -158,16 +188,12 @@ def process_partition(
             "core_position": core_pos,
             "chaos": chaos,
             "special_penalty": special_penalty,
-            "rating_reason": reason,
             "year": target_year,
             "month": target_month,
             "day": target_day,
         })
 
-    if results:
-        pdf = pd.DataFrame(results)
-        df = spark.createDataFrame(pdf)
-        df.write.mode("append").insertInto(result_table)
+    return results
 
 
 # ---------- 主函数 ----------
@@ -177,9 +203,9 @@ def main():
     parser.add_argument("--target-table", type=str, required=True, help="目标 Hive 表名")
     parser.add_argument("--dt", type=str, required=True, help="源表分区日期，格式 yyyyMMdd")
     parser.add_argument("--dify-workflow-id", type=str, required=True, help="Dify 工作流 ID")
-    parser.add_argument("--dify-url", type=str, default="https://dify.17usoft.com", help="Dify API 基础地址")
-    parser.add_argument("--dify-api-key", type=str, required=False, default=None, help="Dify API Key（公开访问可不提供）")
-    parser.add_argument("--batch-size", type=int, default=100, help="每个 partition 内批量大小（控制内存）")
+    parser.add_argument("--dify-url", type=str, default="https://difyapi.17usoft.com/v1", help="Dify API 基础地址")
+    parser.add_argument("--dify-api-key", type=str, required=True, help="Dify API Key")
+    parser.add_argument("--batch-size", type=int, default=100, help="每个 partition 内批量大小（控制内存，本脚本未使用）")
     args = parser.parse_args()
 
     # 解析分区日期
@@ -195,8 +221,7 @@ def main():
     spark.conf.set("hive.exec.dynamic.partition", "true")
     spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
 
-    # 读取源表（假设源表按 dt 分区，且包含以下字段）
-    # 如果源表一个 traceid 对应多行，则按 traceid 分组取第一行（根据业务逻辑调整）
+    # 读取源表
     sql = f"""
         SELECT
             traceid,
@@ -213,31 +238,18 @@ def main():
     """
     df = spark.sql(sql)
 
-    # 如果存在重复 traceid，按任意规则去重（例如取第一条）
+    # 按 traceid 去重（每个 traceid 只保留一行，假设输入字段相同）
     df = df.dropDuplicates(["traceid"])
 
-    logger.info("共读取 %d 条唯一 traceid 记录", df.count())
+    total = df.count()
+    if total == 0:
+        logger.info("源表分区 %s 没有数据，任务结束。", args.dt)
+        spark.stop()
+        return
 
-    # 定义目标表 schema（需提前创建）
-    target_schema = StructType([
-        StructField("traceid", StringType(), True),
-        StructField("keyword", StringType(), True),
-        StructField("cityid", StringType(), True),
-        StructField("userlat", StringType(), True),
-        StructField("userlon", StringType(), True),
-        StructField("pgpath", StringType(), True),
-        StructField("caller", StringType(), True),
-        StructField("dify_score", IntegerType(), True),
-        StructField("core_position", IntegerType(), True),
-        StructField("chaos", IntegerType(), True),
-        StructField("special_penalty", IntegerType(), True),
-        StructField("rating_reason", StringType(), True),
-        StructField("year", IntegerType(), True),
-        StructField("month", IntegerType(), True),
-        StructField("day", IntegerType(), True),
-    ])
+    logger.info("共读取 %d 条唯一 traceid 记录", total)
 
-    # 先创建空表（若不存在），实际可通过 Hive SQL 提前建表
+    # 确保目标表存在（如果不存在则创建）
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {args.target_table} (
             traceid STRING,
@@ -250,36 +262,69 @@ def main():
             dify_score INT,
             core_position INT,
             chaos INT,
-            special_penalty INT,
-            rating_reason STRING
+            special_penalty INT
         )
         PARTITIONED BY (year INT, month INT, day INT)
         STORED AS ORC
     """)
 
-    # 使用 foreachPartition 分布式调用 API
-    # 注意：需要将 API 凭证广播到每个 executor（通过闭包变量）
-    api_key = args.dify_api_key
-    workflow_id = args.dify_workflow_id
+    # 收集所有结果（适合数据量不大，如几十万条；如果更大，需改用 foreachPartition 分批写入）
+    # 由于 API 调用较慢，collect 到 Driver 是可行的，但要注意 Driver 内存。
+    # 这里我们直接 collect 后逐条处理，然后一次性写入。
+    rows = df.collect()
+    all_results = []
 
-    # 由于 broadcast 变量无法被 pickle 序列化（requests 模块不支持），
-    # 直接通过闭包传递简单字符串是安全的（每个 executor 都会拿到副本）
-    df.foreachPartition(
-        lambda part: process_partition(
-            part,
-            args.dify_api_key,   # 可为 None
+    for row in rows:
+        inputs = {
+            "keyword": row.keyword,
+            "cityid": str(row.cityid),
+            "userlat": str(row.userlat),
+            "userlon": str(row.userlon),
+            "pgpath": row.pgpath,
+            "caller": row.caller,
+        }
+        outputs = call_dify_workflow(
+            args.dify_api_key,
             args.dify_workflow_id,
             args.dify_url,
-            args.target_table,
-            year,
-            month,
-            day,
+            inputs,
         )
-    )
+        if outputs:
+            score, core_pos, chaos, special_penalty = parse_dify_output(outputs)
+        else:
+            score = core_pos = chaos = special_penalty = None
 
-    logger.info("处理完成，结果已追加到 %s (分区 year=%d, month=%d, day=%d)",
-                args.target_table, year, month, day)
+        all_results.append({
+            "traceid": row.traceid,
+            "keyword": row.keyword,
+            "cityid": row.cityid,
+            "userlat": row.userlat,
+            "userlon": row.userlon,
+            "pgpath": row.pgpath,
+            "caller": row.caller,
+            "dify_score": score,
+            "core_position": core_pos,
+            "chaos": chaos,
+            "special_penalty": special_penalty,
+            "year": year,
+            "month": month,
+            "day": day,
+        })
+        # 控制请求频率，避免触发限流
+        time.sleep(0.1)
+
+    # 将结果转换为 DataFrame 并写入 Hive
+    if all_results:
+        pdf = pd.DataFrame(all_results)
+        result_df = spark.createDataFrame(pdf)
+        result_df.write.mode("append").insertInto(args.target_table)
+        logger.info("成功写入 %d 条记录到表 %s，分区 (%d, %d, %d)",
+                    len(all_results), args.target_table, year, month, day)
+    else:
+        logger.warning("没有生成任何结果记录。")
+
     spark.stop()
+    logger.info("任务完成。")
 
 
 if __name__ == "__main__":
